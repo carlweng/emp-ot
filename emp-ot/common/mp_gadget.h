@@ -5,6 +5,7 @@
 #include "emp-ot/tuning.h"   // kConsistCheckCotNum
 #include <emp-tool/emp-tool.h>
 #include <algorithm>
+#include <cassert>
 #include <future>
 #include <type_traits>
 #include <vector>
@@ -203,9 +204,11 @@ public:
   // thus the whole malicious transcript — are bit-identical to the
   // interleaved run_next_tree path. Only the *timing* of the traffic moves.
   std::vector<block> c_scratch_;      // tree_n * tree_depth corrections (ship-and-forget)
-  std::vector<block> leaves_scratch_; // batch * leave_n  (per-task slots)
+  std::vector<block> leaves_scratch_; // batch * leave_n  (per-task cGGM block slots)
   std::vector<block> K0_scratch_;     // batch * tree_depth
   std::vector<F>     chi_scratch_;    // batch * leave_n (malicious only)
+  std::vector<AuthValue> auth_scratch_; // batch * leave_n (kHasSecretSum only)
+  std::vector<F>         ss_scratch_;   // batch secret_sums (kHasSecretSum only)
 
   // `base` points at the tree_n*tree_depth cGGM-correction base COTs
   // (contiguous; base + i*tree_depth is tree i's K^{ᾱ} input). `seeds`
@@ -214,20 +217,31 @@ public:
   // later with no stored per-round state. `pool` may be null (serial);
   // `batch` bounds peak leaf scratch. Corrections are shipped and not
   // retained (the sender never re-reads them).
+  //
+  // Secret-sum carriers (sVOLE, kHasSecretSum=true): `gammas` supplies the
+  // per-tree carrier scalar (carry_curr_[i].mac) so this also computes and
+  // ships secret_sum_i = gamma_i − Σ leaves_i.mac, byte-identical to and in
+  // the same wire order as run_next_tree (corrections then secret_sum, in
+  // tree order). For Ferret-style carriers `gammas` is unused and may be null.
   void prepare_all(ThreadPool *pool, int batch, const block *base,
-                   const block *seeds) {
-    static_assert(!AuthValue::kHasSecretSum,
-                  "prepare_all: Ferret-style (no secret_sum) path only");
+                   const block *seeds,
+                   [[maybe_unused]] const F *gammas = nullptr) {
     if (batch < 1) batch = 1;
     c_scratch_.resize(tree_n * tree_depth);
     leaves_scratch_.resize((int64_t)batch * leave_n);
     K0_scratch_.resize((int64_t)batch * tree_depth);
     std::vector<block> chi_seeds(batch);
     if (is_malicious) chi_scratch_.resize((int64_t)batch * leave_n);
+    if constexpr (AuthValue::kHasSecretSum) {
+      assert(gammas != nullptr &&
+             "prepare_all: secret_sum carrier needs per-tree gammas");
+      auth_scratch_.resize((int64_t)batch * leave_n);
+      ss_scratch_.resize(batch);
+    }
 
     for (int64_t b0 = 0; b0 < tree_n; b0 += batch) {
       const int B = (int)std::min<int64_t>(batch, tree_n - b0);
-      // (1) expand + correction — parallel, disjoint per-task scratch.
+      // (1) expand + correction (+ secret_sum) — parallel, disjoint scratch.
       mp_parallel_for(pool, B, [&](int s) {
         const int64_t i = b0 + s;
         block *lv = leaves_scratch_.data() + (int64_t)s * leave_n;
@@ -237,39 +251,69 @@ public:
         const block *base_i = base + i * tree_depth;
         block *c_i = c_scratch_.data() + i * tree_depth;
         for (int64_t j = 0; j < tree_depth; ++j) c_i[j] = base_i[j] ^ k0[j];
+        if constexpr (AuthValue::kHasSecretSum) {
+          // Convert the block leaves to carrier pairs and fold secret_sum.
+          AuthValue *av = auth_scratch_.data() + (int64_t)s * leave_n;
+          F leaves_sum = AuthValue::f_zero();
+          for (int64_t k = 0; k < leave_n; ++k) {
+            av[k] = AuthValue::auth_from_block(lv[k]);
+            leaves_sum = AuthValue::f_add(leaves_sum, av[k].mac);
+          }
+          ss_scratch_[s] = AuthValue::f_sub(gammas[i], leaves_sum);
+        }
       });
-      // (2) ship corrections + snapshot chi seed — this thread, tree order.
+      // (2) ship corrections (+ secret_sum) + snapshot chi — this thread,
+      //     tree order, matching run_next_tree's wire layout exactly.
       for (int s = 0; s < B; ++s) {
         const int64_t i = b0 + s;
         io->send_block(c_scratch_.data() + i * tree_depth, tree_depth);
+        if constexpr (AuthValue::kHasSecretSum)
+          io->send_data(&ss_scratch_[s], sizeof(F));
         if (is_malicious) chi_seeds[s] = io->get_digest();
       }
       // (3) VW fold — parallel; each tree writes its own slot.
       if (is_malicious)
         mp_parallel_for(pool, B, [&](int s) {
           const int64_t i = b0 + s;
-          block *lv = leaves_scratch_.data() + (int64_t)s * leave_n;
           F *chi = chi_scratch_.data() + (int64_t)s * leave_n;
           AuthValue::expand_chi(chi_seeds[s], chi, leave_n);
-          AuthValue::accumulate_VW(consist_check_VW[i], chi,
-                                   reinterpret_cast<AuthValue *>(lv), leave_n);
+          const AuthValue *av;
+          if constexpr (AuthValue::kHasSecretSum)
+            av = auth_scratch_.data() + (int64_t)s * leave_n;
+          else
+            av = reinterpret_cast<AuthValue *>(
+                leaves_scratch_.data() + (int64_t)s * leave_n);
+          AuthValue::accumulate_VW(consist_check_VW[i], chi, av, leave_n);
         });
     }
     io->flush();
   }
 
-  // Re-derive one tree's leaves into `leaves_i` from its cGGM root `seed`
-  // (layout-compat block* since kHasSecretSum=false). No wire I/O, no VW
-  // (already folded in prepare_all). Reentrant / const: the caller supplies
-  // `k0_scratch` (tree_depth blocks, the throwaway correction sink) so
-  // concurrent threads can produce disjoint trees.
-  void produce_tree(AuthValue *leaves_i, block seed,
-                    block *k0_scratch) const {
-    static_assert(!AuthValue::kHasSecretSum,
-                  "produce_tree: Ferret-style path only");
-    cggm::build_sender<cggm::kTile, AuthValue::kClearLeafLSB>(
-        tree_depth, cggm_delta, seed,
-        reinterpret_cast<block *>(leaves_i), k0_scratch);
+  // Re-derive one tree's leaves into `leaves_i` from its cGGM root `seed`.
+  // No wire I/O, no VW (already folded in prepare_all). Reentrant / const:
+  // the caller supplies `k0_scratch` (tree_depth blocks, the throwaway
+  // correction sink) so concurrent threads can produce disjoint trees.
+  //
+  // Ferret-style (kHasSecretSum=false): AuthValue is layout-compat with
+  // block, so cGGM writes straight into `leaves_i`; `leaf_scratch` is unused.
+  // Secret-sum carriers: cGGM writes the `leaf_scratch` block buffer (leave_n
+  // blocks, caller-owned) and auth_from_block converts into `leaves_i`. The
+  // secret_sum itself was shipped in prepare_all, so produce only re-derives
+  // the carrier macs — gamma is not needed here.
+  void produce_tree(AuthValue *leaves_i, block seed, block *k0_scratch,
+                    [[maybe_unused]] block *leaf_scratch = nullptr) const {
+    if constexpr (!AuthValue::kHasSecretSum) {
+      cggm::build_sender<cggm::kTile, AuthValue::kClearLeafLSB>(
+          tree_depth, cggm_delta, seed,
+          reinterpret_cast<block *>(leaves_i), k0_scratch);
+    } else {
+      assert(leaf_scratch != nullptr &&
+             "produce_tree: secret_sum carrier needs a leave_n leaf_scratch");
+      cggm::build_sender<cggm::kTile, AuthValue::kClearLeafLSB>(
+          tree_depth, cggm_delta, seed, leaf_scratch, k0_scratch);
+      for (int64_t i = 0; i < leave_n; ++i)
+        leaves_i[i] = AuthValue::auth_from_block(leaf_scratch[i]);
+    }
   }
 
   // F2kPacked round-final check. Mutates `pre_cot_data[i]` for i in
@@ -347,6 +391,38 @@ public:
     F vb = AuthValue::f_add(AuthValue::f_mul(delta, x_star), triple_t.mac);
     for (int64_t i = 0; i < tree_n; ++i)
       vb = AuthValue::f_add(vb, consist_check_VW[i]);
+    block h = RO(kDomCheckTyped, sid).absorb(&vb, sizeof(F)).squeeze_block();
+    io->send_data(&h, sizeof(block));
+    io->flush();
+  }
+
+  // ---- Batched FTyped check (SilentSvole multi-round prepay) -------------
+  // The FTyped analog of the batched packed check above: extend the per-round
+  // run_end_typed to ONE check over a whole K-round prepay (m = K*t trees). The
+  // check is linear (vb_r == va_r per round; summing preserves equality), so
+  // each round's δ-free part folds into one F accumulator with NO I/O, and a
+  // single round-trip closes the batch. For K=1 this is byte-identical to
+  // run_end_typed (one accumulator == one round's vb), so a no-arg SilentSvole
+  // stays a wire-equivalent drop-in for Svole.
+  //
+  // fold_round_check_typed: add this round's δ-free part — triple_t.mac plus
+  // the sum of the round's VW (already in consist_check_VW from prepare_all).
+  void fold_round_check_typed(F &acc_vb, AuthValue triple_t) {
+    static_assert(AuthValue::kChiFoldFlavor == ChiFoldFlavor::FTyped,
+                  "fold_round_check_typed: AuthValue is not FTyped");
+    if (!is_malicious) return;
+    acc_vb = AuthValue::f_add(acc_vb, triple_t.mac);
+    for (int64_t i = 0; i < tree_n; ++i)
+      acc_vb = AuthValue::f_add(acc_vb, consist_check_VW[i]);
+  }
+
+  // Single round-trip over the whole batch. `acc_vb` is the running δ-free sum;
+  // `acc_xstar` (= Σ_r x_star_r) arrives from the receiver and is scaled by Δ.
+  void finalize_batched_typed_sender(F acc_vb) {
+    if (!is_malicious) return;
+    F x_star;
+    io->recv_data(&x_star, sizeof(F));
+    F vb = AuthValue::f_add(AuthValue::f_mul(delta, x_star), acc_vb);
     block h = RO(kDomCheckTyped, sid).absorb(&vb, sizeof(F)).squeeze_block();
     io->send_data(&h, sizeof(block));
     io->flush();
@@ -482,9 +558,10 @@ public:
   // recv + per-tree get_digest() stay on this thread in tree order (so the
   // chi seeds match the sender's snapshots); the cGGM eval + VW run on
   // `pool` a batch at a time over disjoint per-task scratch.
-  std::vector<block> leaves_scratch_; // batch * leave_n  (per-task slots)
+  std::vector<block> leaves_scratch_; // batch * leave_n  (per-task cGGM block slots)
   std::vector<block> K_recv_scratch_; // batch * tree_depth
   std::vector<F>     chi_scratch_;    // batch * leave_n (malicious only)
+  std::vector<AuthValue> auth_scratch_; // batch * leave_n (kHasSecretSum only)
 
   // `base` points at the tree_n*tree_depth cGGM-correction base COTs
   // (contiguous; base + i*tree_depth is tree i's input). The received
@@ -492,22 +569,37 @@ public:
   // — the receiver *cannot* re-derive them, so the caller retains them and
   // hands the matching slice back to produce_tree. `pool` may be null
   // (serial); `batch` bounds peak leaf scratch.
+  //
+  // Secret-sum carriers (sVOLE, kHasSecretSum=true): each tree also carries a
+  // secret_sum:F on the wire and `triple_yz` supplies the per-tree carrier
+  // scalar used in the α-fill. The received secret_sums are written into
+  // `ss_out` (tree_n F's, caller-owned) and — like the corrections — handed
+  // back to produce_tree at consume time. For Ferret-style carriers both
+  // `triple_yz` and `ss_out` are unused and may be null.
   void prepare_all(ThreadPool *pool, int batch, const block *base,
-                   block *c_out) {
-    static_assert(!AuthValue::kHasSecretSum,
-                  "prepare_all: Ferret-style (no secret_sum) path only");
+                   block *c_out,
+                   [[maybe_unused]] const F *triple_yz = nullptr,
+                   [[maybe_unused]] F *ss_out = nullptr) {
     if (batch < 1) batch = 1;
     leaves_scratch_.resize((int64_t)batch * leave_n);
     K_recv_scratch_.resize((int64_t)batch * tree_depth);
     std::vector<block> chi_seeds(batch);
     if (is_malicious) chi_scratch_.resize((int64_t)batch * leave_n);
+    if constexpr (AuthValue::kHasSecretSum) {
+      assert(triple_yz != nullptr && ss_out != nullptr &&
+             "prepare_all: secret_sum carrier needs triple_yz and ss_out");
+      auth_scratch_.resize((int64_t)batch * leave_n);
+    }
 
     for (int64_t b0 = 0; b0 < tree_n; b0 += batch) {
       const int B = (int)std::min<int64_t>(batch, tree_n - b0);
-      // (1) recv corrections + snapshot chi seed — this thread, tree order.
+      // (1) recv corrections (+ secret_sum) + snapshot chi — this thread,
+      //     tree order, matching run_next_tree's wire layout exactly.
       for (int s = 0; s < B; ++s) {
         const int64_t i = b0 + s;
         io->recv_block(c_out + i * tree_depth, tree_depth);
+        if constexpr (AuthValue::kHasSecretSum)
+          io->recv_data(&ss_out[i], sizeof(F));
         if (is_malicious) chi_seeds[s] = io->get_digest();
       }
       // (2) eval + α-fill (+ malicious chi_alpha / VW) — parallel.
@@ -517,13 +609,23 @@ public:
         const block *c_i = c_out + i * tree_depth;
         block *lv = leaves_scratch_.data() + (int64_t)s * leave_n;
         block *kr = K_recv_scratch_.data() + (int64_t)s * tree_depth;
-        const uint32_t rev = eval_one_(base_i, c_i, lv, kr);
+        uint32_t rev;
+        const AuthValue *vw_leaves;
+        if constexpr (AuthValue::kHasSecretSum) {
+          AuthValue *av = auth_scratch_.data() + (int64_t)s * leave_n;
+          rev = eval_one_auth_(base_i, c_i, av, lv, kr, ss_out[i],
+                               triple_yz[i]);
+          vw_leaves = av;
+        } else {
+          rev = eval_one_(base_i, c_i, lv, kr);
+          vw_leaves = reinterpret_cast<AuthValue *>(lv);
+        }
         if (is_malicious) {
           F *chi = chi_scratch_.data() + (int64_t)s * leave_n;
           AuthValue::expand_chi(chi_seeds[s], chi, leave_n);
           consist_check_chi_alpha[i] = chi[rev];
-          AuthValue::accumulate_VW(consist_check_VW[i], chi,
-                                   reinterpret_cast<AuthValue *>(lv), leave_n);
+          AuthValue::accumulate_VW(consist_check_VW[i], chi, vw_leaves,
+                                   leave_n);
         }
       });
     }
@@ -534,12 +636,27 @@ public:
   // VW (already folded in prepare_all). Reentrant / const: the caller
   // supplies `kr_scratch` (tree_depth blocks) so concurrent threads can
   // produce disjoint trees. Returns bit_reverse(alpha) (the punctured slot).
+  //
+  // Ferret-style: writes block-compat leaves straight into `leaves_i`;
+  // `lv_scratch` / `secret_sum` / `triple_yz_i` are unused. Secret-sum
+  // carriers: cGGM evals into `lv_scratch` (leave_n blocks, caller-owned)
+  // and the α-fill recomputes leaves_i[rev].mac from the stored `secret_sum`
+  // and `triple_yz_i` — both retained by the caller from prepare_all.
   uint32_t produce_tree(AuthValue *leaves_i, const block *base_i,
-                        const block *c_i, block *kr_scratch) const {
-    static_assert(!AuthValue::kHasSecretSum,
-                  "produce_tree: Ferret-style path only");
-    return eval_one_(base_i, c_i,
-                     reinterpret_cast<block *>(leaves_i), kr_scratch);
+                        const block *c_i, block *kr_scratch,
+                        [[maybe_unused]] block *lv_scratch = nullptr,
+                        [[maybe_unused]] F secret_sum = AuthValue::f_zero(),
+                        [[maybe_unused]] F triple_yz_i =
+                            AuthValue::f_zero()) const {
+    if constexpr (!AuthValue::kHasSecretSum) {
+      return eval_one_(base_i, c_i,
+                       reinterpret_cast<block *>(leaves_i), kr_scratch);
+    } else {
+      assert(lv_scratch != nullptr &&
+             "produce_tree: secret_sum carrier needs a leave_n lv_scratch");
+      return eval_one_auth_(base_i, c_i, leaves_i, lv_scratch, kr_scratch,
+                            secret_sum, triple_yz_i);
+    }
   }
 
  private:
@@ -560,6 +677,37 @@ public:
     block nodes_sum = zero_block;
     for (int64_t k = 0; k < leave_n; ++k) nodes_sum = nodes_sum ^ lv[k];
     lv[rev] = nodes_sum ^ lsb_only_mask;
+    return rev;
+  }
+
+  // Secret-sum (FTyped) α-fill body for one tree, mirroring the
+  // kHasSecretSum branch of run_next_tree: cGGM eval into the block scratch
+  // `lv`, convert every non-punctured leaf to a carrier pair, and recover the
+  // punctured mac as triple_yz_i − (secret_sum + Σ_{i≠rev} mac). The caller
+  // fills leaves_i[rev].val. const / reentrant via caller-owned `lv` + `kr`.
+  uint32_t eval_one_auth_(const block *base_i, const block *c_i,
+                          AuthValue *leaves_i, block *lv, block *kr,
+                          F secret_sum, F triple_yz_i) const {
+    uint32_t alpha = 0;
+    for (int64_t j = 0; j < tree_depth; ++j) {
+      alpha <<= 1;
+      if (!getLSB(base_i[j])) alpha += 1;
+    }
+    const uint32_t rev = cggm::bit_reverse(alpha, (int)tree_depth);
+    for (int64_t j = 0; j < tree_depth; ++j) kr[j] = base_i[j] ^ c_i[j];
+    cggm::eval_receiver<cggm::kTile, AuthValue::kClearLeafLSB>(
+        tree_depth, alpha, kr, lv);
+    F nodes_sum = AuthValue::f_zero();
+    for (int64_t i = 0; i < leave_n; ++i) {
+      if ((uint32_t)i == rev) {
+        leaves_i[i] = AuthValue{};   // .mac filled below; .val by caller
+        continue;
+      }
+      leaves_i[i] = AuthValue::auth_from_block(lv[i]);
+      nodes_sum = AuthValue::f_add(nodes_sum, leaves_i[i].mac);
+    }
+    leaves_i[rev].mac =
+        AuthValue::f_sub(triple_yz_i, AuthValue::f_add(secret_sum, nodes_sum));
     return rev;
   }
 
@@ -669,6 +817,37 @@ public:
     io->recv_data(&r, sizeof(block));
     if (!cmpBlock(&r, &h, 1))
       error("MultiPointGadget chi-fold check failed");
+  }
+
+  // ---- Batched FTyped check (SilentSvole multi-round prepay) -------------
+  // Mirror of the sender's batched check. Per round fold x_star_r (=
+  // Σ_i triples.val·chi_alpha + triple_t.val) into acc_xstar and va_r (=
+  // triple_t.mac + Σ_i VW) into acc_va; one round-trip closes the batch. K=1 is
+  // byte-identical to run_end_typed (one x_star, one digest comparison).
+  void fold_round_check_typed(F &acc_xstar, F &acc_va,
+                              const AuthValue *triples, AuthValue triple_t) {
+    static_assert(AuthValue::kChiFoldFlavor == ChiFoldFlavor::FTyped,
+                  "fold_round_check_typed: AuthValue is not FTyped");
+    if (!is_malicious) return;
+    for (int64_t i = 0; i < tree_n; ++i)
+      acc_xstar = AuthValue::f_add(
+          acc_xstar,
+          AuthValue::f_mul(triples[i].val, consist_check_chi_alpha[i]));
+    acc_xstar = AuthValue::f_add(acc_xstar, triple_t.val);
+    acc_va = AuthValue::f_add(acc_va, triple_t.mac);
+    for (int64_t i = 0; i < tree_n; ++i)
+      acc_va = AuthValue::f_add(acc_va, consist_check_VW[i]);
+  }
+
+  void finalize_batched_typed_receiver(F acc_xstar, F acc_va) {
+    if (!is_malicious) return;
+    io->send_data(&acc_xstar, sizeof(F));
+    io->flush();
+    block h = RO(kDomCheckTyped, sid).absorb(&acc_va, sizeof(F)).squeeze_block();
+    block r;
+    io->recv_data(&r, sizeof(block));
+    if (!cmpBlock(&r, &h, 1))
+      error("MultiPointGadget batched chi-fold check failed");
   }
 };
 

@@ -193,8 +193,11 @@ public:
     this->exit_session_();
   }
 
-private:
+protected:
   // -------- Per-stage helpers --------
+  // protected (not private) and process_one_tree_ virtual so SilentSvole can
+  // reuse the bootstrap / base-COT pull / buffers / LPN / gadgets and override
+  // only the per-tree body (wire-free re-derive). Mirrors Ferret/SilentFerret.
 
   // Lazy bootstrap, gated by setup_done. Delegates to the carrier's
   // protocol-specific Bootstrap (Galois packing for F2k; COPE +
@@ -231,7 +234,7 @@ private:
   // tree) or `carry_next_ + (refill_idx) * chunk` (refill tree). The
   // MPFSS gadget writes leaves directly into `dst`; LPN folds
   // in-place over the same `dst` slot.
-  void process_one_tree_(AuthValue *dst) {
+  virtual void process_one_tree_(AuthValue *dst) {
     const int64_t chunk = chunk_size();
     const int64_t tt = param.t;
     const block *base_i =

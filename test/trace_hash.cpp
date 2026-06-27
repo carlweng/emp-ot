@@ -142,6 +142,15 @@ int main(int argc, char** argv) {
     const int64_t ferret_len = ferret_cpr;       // 1 round (smaller for CI)
 #endif
 
+    // Like Ferret/SilentFerret, Svole and SilentSvole are byte-identical only
+    // over a WHOLE number of SilentSvole rounds (a partial tail makes
+    // SilentSvole over-ship that round's t corrections). run_svole uses the
+    // default param (ferret_b13); one round produces (t - refill_trees) chunks.
+    const int64_t svole_cpr =
+        (tuning::ferret_b13.t - tuning::ferret_b13.refill_trees)
+        << tuning::ferret_b13.tree_depth;
+    const int64_t svole_wr = svole_cpr * 2;       // 2 rounds → exercises rollover
+
     // FS send_first conventions per protocol family:
     //   RCOT extensions: is_ot_sender() = (party == ALICE).
     //   F2kVOLE: is_delta_holder() = (party == BOB).
@@ -209,6 +218,35 @@ int main(int argc, char** argv) {
                 [](auto& sv) {
                     PRG prg;
                     uint64_t d;
+                    prg.random_data_unaligned(&d, sizeof(d));
+                    sv.set_delta(d % AuthValueFp::PR_VAL);
+                });
+        });
+
+        // Wire-equivalence guard: each *(wr) pair runs the plain and Silent
+        // VOLE at the same whole-rounds length from the same reset seed, so the
+        // two rows MUST be byte-identical — a refactor that breaks SilentSvole's
+        // wire equivalence shows the pair diverging (mirrors Ferret==SilentFerret).
+        measure(party, port, "F2kVOLE(wr) " + mode, f2k_sf, [&](NetIO* io){
+            run_svole<F2kVOLE<>>(io, party, svole_wr, mali,
+                [](auto&){ /* keep auto Δ */ });
+        });
+        measure(party, port, "SilentF2kVOLE(wr) " + mode, f2k_sf, [&](NetIO* io){
+            run_svole<SilentF2kVOLE<>>(io, party, svole_wr, mali,
+                [](auto&){ /* keep auto Δ */ });
+        });
+        measure(party, port, "FpVOLE(wr) " + mode, fp_sf, [&](NetIO* io){
+            run_svole<FpVOLE<>>(io, party, svole_wr, mali,
+                [](auto& sv) {
+                    PRG prg; uint64_t d;
+                    prg.random_data_unaligned(&d, sizeof(d));
+                    sv.set_delta(d % AuthValueFp::PR_VAL);
+                });
+        });
+        measure(party, port, "SilentFpVOLE(wr) " + mode, fp_sf, [&](NetIO* io){
+            run_svole<SilentFpVOLE<>>(io, party, svole_wr, mali,
+                [](auto& sv) {
+                    PRG prg; uint64_t d;
                     prg.random_data_unaligned(&d, sizeof(d));
                     sv.set_delta(d % AuthValueFp::PR_VAL);
                 });

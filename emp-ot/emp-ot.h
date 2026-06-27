@@ -16,5 +16,6 @@
 
 #include "emp-ot/svole/f2k_vole.h"
 #include "emp-ot/svole/fp_vole.h"
+#include "emp-ot/svole/silent_svole.h"
 
 #endif
